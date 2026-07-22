@@ -29,7 +29,7 @@ def load_macro_data(filepath="Rates.xlsx"):
     return df_macro.set_index('Date')
 
 
-def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000):
+def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000, q_bar=500):
     dates = lister_dates_disponibles(nb_jours)
     if not dates:
         print("⚠️ Aucune date trouvée.")
@@ -75,11 +75,10 @@ def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000):
             
         # Extraction des paramètres macro pour la journée courante (date_str)
         if date_str in df_macro.index:
-            sofr_rate = float(df_macro.loc[date_str, 'SOFR']) / 100.0  # ex: 3.57 -> 0.0357
-            fx_rate = float(df_macro.loc[date_str, 'EURUSD'])          # ex: 1.1699
-            tn_points = float(df_macro.loc[date_str, 'EURTN'])         # ex: 0.560
+            sofr_rate = float(df_macro.loc[date_str, 'SOFR']) / 100.0
+            fx_rate = float(df_macro.loc[date_str, 'EURUSD'])
+            tn_points = float(df_macro.loc[date_str, 'EURTN'])
         else:
-            # Fallback historique standard en cas de jour manquant
             sofr_rate, fx_rate, tn_points = 0.053, 1.15, 0.0
 
         for i, row in df_trades_enriched.iterrows():
@@ -87,18 +86,18 @@ def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000):
             current_mid = row["Mid"]
             vol = row["vol"]
             volume_row = row["volume"]
+            bid_price = row["Bid"]
+            ask_price = row["Ask"]
 
             last_mid = current_mid
             last_vol = vol
 
-            # Modèle Avellaneda-Stoikov
             total_inv = pnl_tracker.inv_veille + pnl_tracker.inventory_intraday
             my_bid, my_ask = strategy.get_quotes(current_mid, total_inv, vol)
             
             if my_bid <= 0 or my_ask <= 0 or my_bid >= my_ask:
                 continue
  
-            # ── Exécution Événementielle ──────────────────────────────────────
             if price >= my_ask:
                 if total_inv > -max_inventory:
                     qty = min(volume_row, max_inventory + total_inv)
@@ -112,8 +111,21 @@ def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000):
                     if qty > 0:
                         pnl_tracker.update_on_trade('BUY', qty, price, current_mid)
                         daily_volume_usd += qty * price
-        
-        # Récupération du rapport contenant la conversion Euro et l'effet TN
+            
+            # Hedging logic
+            total_inv = pnl_tracker.inv_veille + pnl_tracker.inventory_intraday
+            if total_inv > q_bar:
+                qty_to_hedge = total_inv - q_bar
+                print(f"🔥 HEDGING: Inventory {total_inv} > {q_bar}. Selling {qty_to_hedge} at market.")
+                pnl_tracker.update_on_trade('SELL', qty_to_hedge, bid_price, current_mid)
+                daily_volume_usd += qty_to_hedge * bid_price
+            elif total_inv < -q_bar:
+                qty_to_hedge = abs(total_inv) - q_bar
+                print(f"🔥 HEDGING: Inventory {total_inv} < -{q_bar}. Buying {qty_to_hedge} at market.")
+                pnl_tracker.update_on_trade('BUY', qty_to_hedge, ask_price, current_mid)
+                daily_volume_usd += qty_to_hedge * ask_price
+
+
         final = pnl_tracker.get_pnl_report(last_mid, sofr_rate=sofr_rate, fx_rate=fx_rate, tn_points=tn_points)
         pnl_bps = (final['pnl_total'] / daily_volume_usd) * 10000 if daily_volume_usd > 0 else 0
         
@@ -136,7 +148,6 @@ def run_backtest_multijours(nb_jours=130, gamma=0.1, max_inventory=15000):
             'pnl_bps'          : pnl_bps,
         })
  
-        # Application définitive du coût de portage pour basculer à la veille de demain
         pnl_tracker.reset_for_new_day(current_mid=last_mid, sofr_rate=sofr_rate, tn_points=tn_points)
  
     return pd.DataFrame(results)
